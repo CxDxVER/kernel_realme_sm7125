@@ -106,8 +106,6 @@ static const struct of_device_id dsi_display_dt_match[] = {
 	{}
 };
 
-static unsigned int cur_refresh_rate = 60;
-
 static void dsi_display_mask_ctrl_error_interrupts(struct dsi_display *display,
 			u32 mask, bool enable)
 {
@@ -5181,22 +5179,10 @@ error:
 	return rc;
 }
 
-static struct attribute *display_fs_attrs[] = {
-	NULL,
-};
-
-static struct attribute_group display_fs_attrs_group = {
-	.attrs = display_fs_attrs,
-};
-
 static int dsi_display_sysfs_init(struct dsi_display *display)
 {
 	int rc = 0;
 	struct device *dev = &display->pdev->dev;
-
-	rc = sysfs_create_group(&dev->kobj, &display_fs_attrs_group);
-	if (rc)
-		pr_err("failed to create display device attributes");
 
 	if (display->panel->panel_mode == DSI_OP_CMD_MODE)
 		rc = sysfs_create_group(&dev->kobj,
@@ -5302,7 +5288,11 @@ static int dsi_display_bind(struct device *dev,
 		goto error;
 	}
 
-	dsi_display_debugfs_init(display);
+	rc = dsi_display_debugfs_init(display);
+	if (rc) {
+		pr_err("[%s] debugfs init failed, rc=%d\n", display->name, rc);
+		goto error;
+	}
 
 	atomic_set(&display->clkrate_change_pending, 0);
 	display->cached_clk_rate = 0;
@@ -6761,9 +6751,12 @@ int dsi_display_validate_mode_change(struct dsi_display *display,
 		/* dfps and dynamic clock with const fps use case */
 		if (dsi_display_mode_switch_dfps(cur_mode, adj_mode)) {
 			dsi_panel_get_dfps_caps(display->panel, &dfps_caps);
+			#ifdef OPLUS_BUG_STABILITY
+			/*liping-m@PSW.MM.Display.LCD,2019/6/20,for 90FPS LCD */
 			if (cur_mode->timing.refresh_rate != adj_mode->timing.refresh_rate) {
-				WRITE_ONCE(cur_refresh_rate, adj_mode->timing.refresh_rate);
+				pr_err("dsi_cmd set fps: %d\n", adj_mode->timing.refresh_rate);
 			}
+			#endif /*OPLUS_BUG_STABILITY*/
 			if (dfps_caps.dfps_support ||
 			    dyn_clk_caps->maintain_const_fps) {
 				pr_debug("mode switch is variable refresh\n");
@@ -7698,11 +7691,6 @@ int dsi_display_pre_commit(void *display,
 	return rc;
 }
 
-unsigned int dsi_panel_get_refresh_rate(void)
-{
-	return READ_ONCE(cur_refresh_rate);
-}
-
 int dsi_display_enable(struct dsi_display *display)
 {
 	int rc = 0;
@@ -7747,7 +7735,6 @@ int dsi_display_enable(struct dsi_display *display)
 	mutex_lock(&display->display_lock);
 
 	mode = display->panel->cur_mode;
-	WRITE_ONCE(cur_refresh_rate, mode->timing.refresh_rate);
 
 	if (mode->dsi_mode_flags & DSI_MODE_FLAG_DMS) {
 		rc = dsi_panel_post_switch(display->panel);
