@@ -16,7 +16,6 @@
 #include <linux/math64.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
-#include <linux/input.h>
 #include <linux/io.h>
 #include <linux/ftrace.h>
 #include <linux/mm.h>
@@ -59,23 +58,9 @@ static DEFINE_SPINLOCK(suspend_lock);
 
 #define TAG "msm_adreno_tz: "
 
-static unsigned int adrenoboost = 10000;
 static u64 suspend_time;
 static u64 suspend_start;
 static unsigned long acc_total, acc_relative_busy;
-
-static struct workqueue_struct *workqueue;
-
-static struct devfreq *tz_devfreq_g;
-static struct work_struct boost_work;
-static struct delayed_work unboost_work;
-static bool gpu_boost_running;
-
-static unsigned long boost_freq;
-module_param(boost_freq, ulong, 0644);
-
-static unsigned long boost_duration;
-module_param(boost_duration, ulong, 0644);
 
 /*
  * Returns GPU suspend time in millisecond.
@@ -94,30 +79,6 @@ u64 suspend_time_ms(void)
 	suspend_start = suspend_sampling_time;
 	return time_diff;
 }
-
-static ssize_t adrenoboost_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	size_t count = 0;
-	count += sprintf(buf, "%d\n", adrenoboost);
-
-	return count;
-}
-
-static ssize_t adrenoboost_save(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	int input;
-	sscanf(buf, "%d ", &input);
-	if (input < 0 || input > 50000) {
-		adrenoboost = 0;
-	} else {
-		adrenoboost = input;
-	}
-
-	return count;
-}
-
 
 static ssize_t gpu_load_show(struct device *dev,
 		struct device_attribute *attr,
@@ -165,9 +126,6 @@ static ssize_t suspend_time_show(struct device *dev,
 	return snprintf(buf, PAGE_SIZE, "%llu\n", time_diff);
 }
 
-static DEVICE_ATTR(adrenoboost, 0644,
-		adrenoboost_show, adrenoboost_save);
-
 static DEVICE_ATTR(gpu_load, 0444, gpu_load_show, NULL);
 
 static DEVICE_ATTR(suspend_time, 0444,
@@ -177,7 +135,6 @@ static DEVICE_ATTR(suspend_time, 0444,
 static const struct device_attribute *adreno_tz_attr_list[] = {
 		&dev_attr_gpu_load,
 		&dev_attr_suspend_time,
-		&dev_attr_adrenoboost,
 		NULL
 };
 
@@ -378,10 +335,6 @@ static inline int devfreq_get_freq_level(struct devfreq *devfreq,
 	return -EINVAL;
 }
 
-#ifdef CONFIG_ADRENO_IDLER
-extern int adreno_idler(struct devfreq_dev_status stats, struct devfreq *devfreq,
-		 unsigned long *freq);
-#endif
 static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 {
 	int result = 0;
@@ -398,21 +351,7 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 		return result;
 	}
 
-	/* Prevent overflow */
-	if (stats.busy_time >= (1 << 24) || stats.total_time >= (1 << 24)) {
-		stats.busy_time >>= 7;
-		stats.total_time >>= 7;
-	}
-
 	*freq = stats.current_frequency;
-
-#ifdef CONFIG_ADRENO_IDLER
-	if (adreno_idler(stats, devfreq, freq)) {
-		/* adreno_idler has asked to bail out now */
-		return 0;
-	}
-#endif
-	
 	priv->bin.total_time += stats.total_time;
 	priv->bin.busy_time += stats.busy_time;
 
@@ -545,14 +484,6 @@ static int tz_handler(struct devfreq *devfreq, unsigned int event, void *data)
 {
 	int result;
 
-	struct msm_adreno_extended_profile *gpu_profile = container_of(
-					(devfreq->profile),
-					struct msm_adreno_extended_profile,
-					profile);
-
-	if (!tz_devfreq_g)
-		tz_devfreq_g = devfreq;
-
 	switch (event) {
 	case DEVFREQ_GOV_START:
 		result = tz_start(devfreq);
@@ -630,160 +561,8 @@ static struct devfreq_governor msm_adreno_tz = {
 	.event_handler = tz_handler,
 };
 
-static void gpu_update_devfreq(struct devfreq *devfreq)
-{
-	mutex_lock(&devfreq->lock);
-	update_devfreq(devfreq);
-	mutex_unlock(&devfreq->lock);
-}
-
-static void gpu_boost_worker(struct work_struct *work)
-{
-	struct devfreq *devfreq = tz_devfreq_g;
-
-	devfreq->min_freq = boost_freq;
-
-	gpu_update_devfreq(devfreq);
-
-	schedule_delayed_work(&unboost_work, msecs_to_jiffies(boost_duration));
-}
-
-static void gpu_unboost_worker(struct work_struct *work)
-{
-	struct devfreq *devfreq = tz_devfreq_g;
-
-	/* Use lowest frequency */
-	devfreq->min_freq =
-		devfreq->profile->freq_table[devfreq->profile->max_state - 1];
-
-	gpu_update_devfreq(devfreq);
-
-	gpu_boost_running = false;
-}
-
-static void gpu_ib_input_event(struct input_handle *handle,
-		unsigned int type, unsigned int code, int value)
-{
-	bool suspended;
-
-	if (!boost_freq || !boost_duration)
-		return;
-
-	if (!tz_devfreq_g)
-		return;
-
-	spin_lock(&suspend_lock);
-	suspended = suspend_start;
-	spin_unlock(&suspend_lock);
-
-	if (suspended)
-		return;
-
-	if (gpu_boost_running) {
-		if (cancel_delayed_work_sync(&unboost_work)) {
-			schedule_delayed_work(&unboost_work,
-				msecs_to_jiffies(boost_duration));
-			return;
-		}
-	}
-
-	gpu_boost_running = true;
-	queue_work(system_highpri_wq, &boost_work);
-}
-
-static int gpu_ib_input_connect(struct input_handler *handler,
-		struct input_dev *dev, const struct input_device_id *id)
-{
-	struct input_handle *handle;
-	int ret;
-
-	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
-	if (!handle)
-		return -ENOMEM;
-
-	handle->dev = dev;
-	handle->handler = handler;
-	handle->name = "gpu_ib_handle";
-
-	ret = input_register_handle(handle);
-	if (ret)
-		goto err2;
-
-	ret = input_open_device(handle);
-	if (ret)
-		goto err1;
-
-	return 0;
-
-err1:
-	input_unregister_handle(handle);
-err2:
-	kfree(handle);
-	return ret;
-}
-
-static void gpu_ib_input_disconnect(struct input_handle *handle)
-{
-	input_close_device(handle);
-	input_unregister_handle(handle);
-	kfree(handle);
-}
-
-static const struct input_device_id gpu_ib_ids[] = {
-	/* multi-touch touchscreen */
-	{
-		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
-			INPUT_DEVICE_ID_MATCH_ABSBIT,
-		.evbit = { BIT_MASK(EV_ABS) },
-		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] =
-			BIT_MASK(ABS_MT_POSITION_X) |
-			BIT_MASK(ABS_MT_POSITION_Y) },
-	},
-	/* touchpad */
-	{
-		.flags = INPUT_DEVICE_ID_MATCH_KEYBIT |
-			INPUT_DEVICE_ID_MATCH_ABSBIT,
-		.keybit = { [BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH) },
-		.absbit = { [BIT_WORD(ABS_X)] =
-			BIT_MASK(ABS_X) | BIT_MASK(ABS_Y) },
-	},
-	/* Keypad */
-	{
-		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
-		.evbit = { BIT_MASK(EV_KEY) },
-	},
-	{ },
-};
-
-static struct input_handler gpu_ib_input_handler = {
-	.event		= gpu_ib_input_event,
-	.connect	= gpu_ib_input_connect,
-	.disconnect	= gpu_ib_input_disconnect,
-	.name		= "gpu_ib_handler",
-	.id_table	= gpu_ib_ids,
-};
-
-static void gpu_ib_init(void)
-{
-	int ret;
-
-	INIT_WORK(&boost_work, gpu_boost_worker);
-	INIT_DELAYED_WORK(&unboost_work, gpu_unboost_worker);
-
-	ret = input_register_handler(&gpu_ib_input_handler);
-	if (ret)
-		pr_err(TAG "failed to register input handler\n");
-}
-
 static int __init msm_adreno_tz_init(void)
 {
-	workqueue = create_freezable_workqueue("governor_msm_adreno_tz_wq");
-
-	if (workqueue == NULL)
-		return -ENOMEM;
-
-	gpu_ib_init();
-
 	return devfreq_add_governor(&msm_adreno_tz);
 }
 subsys_initcall(msm_adreno_tz_init);
@@ -799,4 +578,4 @@ static void __exit msm_adreno_tz_exit(void)
 
 module_exit(msm_adreno_tz_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL v2");				
